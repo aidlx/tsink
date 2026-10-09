@@ -331,7 +331,88 @@ fn load_store_manifest_from_bytes(bytes: &[u8]) -> Result<Option<TombstoneStoreM
     }
 }
 
+/// 读取 tombstone 索引。
+///
+/// 分片存储的替换是「先写新分片 → 原子替换 manifest → 删掉旧分片」。并发读者可能
+/// 在 manifest 被替换后仍拿着旧 manifest，再去打开刚被删掉的旧分片 → `ENOENT`，
+/// 于是一次正常的存储替换被报成后台 worker 错误（实测 `flush worker error: IO
+/// error: No such file or directory` 每几分钟一次，`degraded` 常亮）。
+///
+/// 这里在 `NotFound` 时重读 manifest 重试：新一轮读到的 manifest 一定指向新分片。
 pub(crate) fn load_tombstones(path: &Path) -> Result<TombstoneMap> {
+    const ATTEMPTS: usize = 3;
+    for attempt in 1..=ATTEMPTS {
+        match load_tombstones_once(path) {
+            Ok(tombstones) => return Ok(tombstones),
+            Err(err) if attempt < ATTEMPTS && is_not_found(&err) => {
+                invoke_tombstone_load_retry_hook(attempt);
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            Err(err) => return Err(err),
+        }
+    }
+    unreachable!("load_tombstones 重试循环必然在循环内返回")
+}
+
+#[cfg(test)]
+type TombstoneLoadRetryHook = dyn Fn(usize) + Send + Sync + 'static;
+
+#[cfg(test)]
+fn tombstone_load_retry_hook_slot(
+) -> &'static std::sync::Mutex<Option<std::sync::Arc<TombstoneLoadRetryHook>>> {
+    static HOOK: std::sync::OnceLock<
+        std::sync::Mutex<Option<std::sync::Arc<TombstoneLoadRetryHook>>>,
+    > = std::sync::OnceLock::new();
+    HOOK.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+/// 测试用：在 `load_tombstones` 重试前插入一个回调（模拟并发写者把 manifest 换掉）。
+#[cfg(test)]
+pub(crate) struct TombstoneLoadRetryHookGuard;
+
+#[cfg(test)]
+impl Drop for TombstoneLoadRetryHookGuard {
+    fn drop(&mut self) {
+        *tombstone_load_retry_hook_slot()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()) = None;
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn on_tombstone_load_retry(
+    hook: impl Fn(usize) + Send + Sync + 'static,
+) -> TombstoneLoadRetryHookGuard {
+    *tombstone_load_retry_hook_slot()
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner()) = Some(std::sync::Arc::new(hook));
+    TombstoneLoadRetryHookGuard
+}
+
+#[cfg(test)]
+fn invoke_tombstone_load_retry_hook(attempt: usize) {
+    let hook = tombstone_load_retry_hook_slot()
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .clone();
+    if let Some(hook) = hook {
+        hook(attempt);
+    }
+}
+
+#[cfg(not(test))]
+fn invoke_tombstone_load_retry_hook(_attempt: usize) {}
+
+/// 是否是「文件被并发替换/删除」造成的 IO 错误（只对这类错误重试）。
+fn is_not_found(err: &TsinkError) -> bool {
+    match err {
+        TsinkError::Io(source) => source.kind() == std::io::ErrorKind::NotFound,
+        TsinkError::IoWithPath { source, .. } => source.kind() == std::io::ErrorKind::NotFound,
+        _ => false,
+    }
+}
+
+fn load_tombstones_once(path: &Path) -> Result<TombstoneMap> {
     let bytes = match std::fs::read(path) {
         Ok(bytes) => bytes,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(TombstoneMap::new()),
@@ -477,6 +558,48 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
+
+    /// 分片存储替换是「先写新分片 → 原子换 manifest → 删旧分片」：并发读者拿着旧 manifest
+    /// 去开旧分片就会 ENOENT（实测线上 `flush worker error: IO error: No such file or
+    /// directory` 每几分钟一次）。重试必须能读到替换后的新 manifest。
+    #[test]
+    fn load_tombstones_retries_when_manifest_references_removed_shard() {
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join(TOMBSTONES_FILE_NAME);
+        let mut tombstones = TombstoneMap::new();
+        tombstones.insert(1, vec![TombstoneRange { start: 10, end: 20 }]);
+        persist_tombstones(&path, &tombstones).unwrap();
+        let good_manifest = std::fs::read(&path).unwrap();
+
+        // 第一次读必然失败：manifest 引用一个不存在的分片。
+        let broken = encode_store_manifest(&TombstoneStoreManifestV2 {
+            version: TOMBSTONE_STORE_VERSION,
+            shard_count: TOMBSTONE_STORE_SHARD_COUNT as u16,
+            shards: (0..TOMBSTONE_STORE_SHARD_COUNT)
+                .map(|index| {
+                    (index == tombstone_shard_index(1))
+                        .then(|| format!("shard-{index:03}-{:016x}.bin", 0xdead_beefu64))
+                })
+                .collect(),
+        })
+        .unwrap();
+        std::fs::write(&path, &broken).unwrap();
+
+        // 重试前把正常 manifest 放回去，等价于「并发写者已经写完新 manifest」。
+        let path_for_hook = path.clone();
+        let restored = std::sync::Arc::new(std::sync::Mutex::new(Some(good_manifest)));
+        let _guard = on_tombstone_load_retry(move |_attempt| {
+            if let Some(bytes) = restored.lock().unwrap().take() {
+                std::fs::write(&path_for_hook, bytes).unwrap();
+            }
+        });
+
+        let loaded = load_tombstones(&path).expect("重试后应读到替换后的 manifest");
+        assert_eq!(
+            loaded,
+            HashMap::from([(1, vec![TombstoneRange { start: 10, end: 20 }])])
+        );
+    }
 
     #[test]
     fn persist_tombstones_returns_error_when_parent_sync_fails() {

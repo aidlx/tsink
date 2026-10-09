@@ -136,13 +136,34 @@ fn build_catalog(
     })
 }
 
+/// 并发压缩会把段目录换掉（L0 → L1/L2），扫描期间目录消失是正常现象：
+/// 这些段已经不在可见集合里，跳过即可。不这样做会把一次正常的压缩报成
+/// 后台 worker 错误（实测 `flush worker error: IO error: No such file or directory`）。
+fn segment_disappeared(err: &TsinkError) -> bool {
+    match err {
+        TsinkError::Io(source) => source.kind() == std::io::ErrorKind::NotFound,
+        TsinkError::IoWithPath { source, .. } => source.kind() == std::io::ErrorKind::NotFound,
+        _ => false,
+    }
+}
+
 fn build_catalog_entries(
     sources: &[PersistedRegistryCatalogSource],
 ) -> Result<Vec<PersistedRegistryCatalogEntry>> {
-    let mut segments = sources
-        .iter()
-        .map(build_catalog_entry)
-        .collect::<Result<Vec<_>>>()?;
+    let mut segments = Vec::with_capacity(sources.len());
+    for source in sources {
+        match build_catalog_entry(source) {
+            Ok(entry) => segments.push(entry),
+            Err(err) if segment_disappeared(&err) => {
+                tracing::warn!(
+                    path = %source.root.display(),
+                    error = %err,
+                    "Segment disappeared during registry catalog scan; skipping"
+                );
+            }
+            Err(err) => return Err(err),
+        }
+    }
     segments.sort_by_key(|entry| (entry.lane, entry.level, entry.segment_id));
     Ok(segments)
 }
@@ -181,7 +202,20 @@ fn build_series_fingerprint_from_sources(
     let mut series_id_by_key = BTreeMap::<(String, Vec<Label>), SeriesId>::new();
 
     for source in sources {
-        for series in crate::engine::segment::load_segment_series_metadata(&source.root)? {
+        let segment_series =
+            match crate::engine::segment::load_segment_series_metadata(&source.root) {
+                Ok(series) => series,
+                Err(err) if segment_disappeared(&err) => {
+                    tracing::warn!(
+                        path = %source.root.display(),
+                        error = %err,
+                        "Segment disappeared during registry series scan; skipping"
+                    );
+                    continue;
+                }
+                Err(err) => return Err(err),
+            };
+        for series in segment_series {
             match series_by_id.get(&series.series_id) {
                 Some(existing)
                     if existing.metric == series.metric && existing.labels == series.labels => {}
